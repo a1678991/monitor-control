@@ -27,7 +27,7 @@
 //!
 //! A display server names a connector `DP-1`; DRM calls the same connector `card1-DP-1`;
 //! and one physical monitor plugged in twice is two outputs but one
-//! [`Monitor`](monitor_control::Monitor). [`Layout::match_monitors`] resolves all three
+//! [`Monitor`]. [`Layout::match_monitors`] resolves all three
 //! mismatches — see there for how.
 
 #![warn(missing_docs)]

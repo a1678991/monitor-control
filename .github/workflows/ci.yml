@@ -17,7 +17,7 @@ jobs:
     name: Test on the minimum supported Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned rather than `stable`: the window needs 1.92 and the workspace says so, and a
       # job that always runs the newest compiler never actually checks that claim.
@@ -47,7 +47,7 @@ jobs:
     name: Build release binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -88,7 +88,7 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: dist/*.tar.gz
@@ -104,7 +104,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
