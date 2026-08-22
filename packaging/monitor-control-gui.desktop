@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor Control
+GenericName=Monitor Brightness and Input
+Comment=Adjust the brightness and input source of external monitors over DDC/CI
+Exec=monitorctl-gui
+Icon=monitor-control-gui
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=monitor;display;brightness;contrast;ddc;ddcci;input;vcp;
+StartupWMClass=monitor-control-gui

@@ -1,0 +1,18 @@
+[package]
+name = "monitorctl"
+description = "CLI to control monitor brightness and input source over DDC/CI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "monitorctl"
+path = "src/main.rs"
+
+[dependencies]
+monitor-control = { workspace = true, features = ["serde"] }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

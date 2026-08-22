@@ -1,0 +1,14 @@
+# Grant desktop users access to the I2C buses that carry DDC/CI to monitors.
+#
+# Without this, talking to a display needs root. The uaccess tag hands an ACL to whoever
+# is logged in at the seat, which is narrower than adding everyone to the `i2c` group.
+#
+# Install with:
+#   sudo cp packaging/60-ddcci-i2c.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# `i2c-dev` must also be loaded:
+#   echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
+#   sudo modprobe i2c-dev
+
+KERNEL=="i2c-[0-9]*", TAG+="uaccess"

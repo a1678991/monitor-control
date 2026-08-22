@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/monitor-control",
+    "crates/monitor-layout",
+    "crates/monitorctl",
+    "crates/monitor-control-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/a1678991/monitor-control"
+
+[workspace.dependencies]
+monitor-control = { path = "crates/monitor-control", version = "0.1.0" }
+monitor-layout = { path = "crates/monitor-layout", version = "0.1.0" }
+libc = "0.2.189"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+
+# The window. Pinned exactly: 0.35 is the last release whose minimum supported Rust matches
+# the toolchain this builds with, and it renamed enough of the API that a silent bump either
+# way would not compile. `glow` replaces the default `wgpu` backend, because drawing
+# rectangles does not need Vulkan and requiring it would lock out machines — virtual ones
+# especially — that have only software GL.
+eframe = { version = "=0.35.0", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    # The window opens where it was left, at the size it was left, with the grouping switch
+    # where it was put. Everything else is read from the hardware at startup.
+    "persistence",
+    "wayland",
+    "x11",
+] }
+
+# Not used directly. Turning off eframe's default features also turns off winit's, and two of
+# those are not reachable through any feature eframe exposes: `wayland-csd-adwaita` draws the
+# title bar on Wayland, where there is no server-side one, and `wayland-dlopen` loads
+# libwayland at run time instead of linking it. Naming winit here switches them back on.
+winit = { version = "0.30.13", default-features = false, features = [
+    "rwh_06",
+    "wayland-csd-adwaita",
+    "wayland-dlopen",
+] }
+
+# Reading the desktop's arrangement. All three are pure Rust: no libwayland, no libxcb, no
+# libdbus, so the binary keeps the same "works without installing anything" property the
+# library has.
+zbus = "5.19"
+x11rb = { version = "0.14", features = ["randr"] }
+wayland-client = "0.31.15"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+rustix = { version = "1.1", features = ["event"] }
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,17 @@
+[package]
+name = "monitor-control"
+description = "Control monitor brightness and input source over DDC/CI, with multi-path discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]

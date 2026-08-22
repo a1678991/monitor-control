@@ -1,0 +1,20 @@
+[package]
+name = "monitor-control-gui"
+description = "Desktop window for controlling monitor brightness and input over DDC/CI"
+version.workspace = true
+edition.workspace = true
+# eframe 0.35 requires it.
+rust-version = "1.92"
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "monitorctl-gui"
+path = "src/main.rs"
+
+[dependencies]
+monitor-control.workspace = true
+monitor-layout.workspace = true
+eframe.workspace = true
+serde.workspace = true
+winit.workspace = true

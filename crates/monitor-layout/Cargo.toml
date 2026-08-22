@@ -1,0 +1,19 @@
+[package]
+name = "monitor-layout"
+description = "Read the desktop's monitor arrangement from GNOME, wlroots-based compositors, or X11"
+version.workspace = true
+edition.workspace = true
+# Above the workspace's own floor because zbus needs it. The library and the CLI keep the
+# lower one; only the parts that talk to a display server pay this.
+rust-version = "1.87"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+monitor-control.workspace = true
+zbus.workspace = true
+serde.workspace = true
+x11rb.workspace = true
+wayland-client.workspace = true
+wayland-protocols-wlr.workspace = true
+rustix.workspace = true
