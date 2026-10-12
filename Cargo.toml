@@ -6,6 +6,9 @@ members = [
     "crates/monitorctl",
     "crates/monitor-control-gui",
 ]
+# Lets a bare `cargo run` open the window. It also narrows every other bare cargo command to
+# that crate, so building or testing everything needs `--workspace`.
+default-members = ["crates/monitor-control-gui"]
 
 [workspace.package]
 version = "0.1.0"

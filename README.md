@@ -75,7 +75,7 @@ extract it, and install `monitorctl` and `monitorctl-gui` from the extracted fol
 using the destinations below. For a source checkout:
 
 ```sh
-cargo build --release
+cargo build --workspace --release
 install -Dm755 target/release/monitorctl ~/.local/bin/monitorctl
 
 # The window, and the desktop entry that gives it a name and an icon.
@@ -433,8 +433,8 @@ Everything below was established by live experiment against the hardware:
 ## Testing
 
 ```sh
-cargo test          # 79 tests, no hardware required
-cargo clippy --all-targets
+cargo test --workspace     # 79 tests, no hardware required
+cargo clippy --workspace --all-targets
 ```
 
 The protocol tests assert against frames captured from real monitors and cross-checked
