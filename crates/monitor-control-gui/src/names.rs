@@ -31,6 +31,7 @@ pub fn input_name(input: InputSource) -> String {
         DisplayPort2 => "DisplayPort 2".into(),
         Hdmi1 => "HDMI 1".into(),
         Hdmi2 => "HDMI 2".into(),
+        UsbC => "USB-C".into(),
         // A vendor-specific value, which no table can name. Saying "Unknown input" and giving
         // the number is honest; printing the number twice, as `0x1b (0x1b)`, is not.
         Other(value) => format!("Unknown input {value:#04x}"),
@@ -108,6 +109,13 @@ fn long_selector(id: &MonitorId, key_is_unique: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_c_is_named_in_the_picker_chip_and_command() {
+        assert_eq!(input_name(InputSource::UsbC), "USB-C");
+        assert_eq!(input_chip(InputSource::UsbC), "USB-C");
+        assert!(input_command(&id(), InputSource::UsbC, true).contains("input set usbc "));
+    }
 
     fn id() -> MonitorId {
         MonitorId { key: "DEL-428C-F1W36H3".into(), connector: "card1-DP-3".into() }

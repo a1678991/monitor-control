@@ -6,7 +6,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::protocol::{self, DDC_SLAVE_ADDR, GET_VCP_REPLY_LEN, MAX_PAYLOAD, VcpValue};
+use super::protocol::{self, DDC_SLAVE_ADDR, GET_VCP_REPLY_LEN, MAX_REPLY_PAYLOAD, VcpValue};
 use crate::error::{DdcError, Error, Result};
 
 /// `I2C_SLAVE` from `linux/i2c-dev.h`: set the slave address for subsequent transfers.
@@ -161,17 +161,31 @@ impl I2cDdc {
 
     /// Send a request and read its reply, retrying transient failures.
     ///
-    /// I/O errors and malformed replies are both retried, because a monitor that is busy
-    /// refreshing tends to NAK the address and to answer with garbage in roughly equal
-    /// measure. Retries back off linearly to give a struggling display room to recover.
+    /// Two retry schedules run side by side, because the failures they answer have
+    /// different shapes:
+    ///
+    /// - Transport noise (I/O errors, garbage frames, bad checksums) is momentary, so it
+    ///   gets [`DdcConfig::retries`] quick attempts with a short linear backoff.
+    /// - Null messages are the display saying "busy, not now", and on MStar scalers they
+    ///   arrive in clusters measured at five-plus consecutive replies over more than a
+    ///   second. Quick retries land entirely inside one cluster and all fail together,
+    ///   so nulls get their own schedule: more attempts, spaced widely enough that the
+    ///   sequence outlasts an observed cluster.
     fn exchange(&mut self, request: &[u8], reply_len: usize) -> Result<Vec<u8>> {
+        /// Attempts allowed for null-message replies (in addition to the first try).
+        const NULL_RETRIES: u32 = 10;
+        /// Spacing between null-message retries. The full schedule spans ~4 s: null
+        /// clusters measured on an INNOCN 27M2V usually run ~1.5 s but occasionally
+        /// exceed 2.5 s, and a schedule that dies inside a cluster reports a healthy
+        /// display as refusing. The cost only materialises on displays that are
+        /// genuinely refusing, where a slow honest answer beats a fast wrong one.
+        const NULL_RETRY_DELAY: Duration = Duration::from_millis(400);
+
+        let mut transport_attempts = 0;
+        let mut null_attempts = 0;
         let mut last: Option<DdcError> = None;
 
-        for attempt in 0..=self.config.retries {
-            if attempt > 0 {
-                std::thread::sleep(self.config.scale(self.config.min_command_interval) * attempt);
-            }
-
+        loop {
             let failure = match self.try_exchange(request, reply_len) {
                 Ok(payload) => return Ok(payload),
                 Err(Error::Ddc { source, .. }) if source.is_retryable() => source,
@@ -180,11 +194,35 @@ impl I2cDdc {
                 Err(other) => return Err(other),
             };
 
+            let retry = if matches!(failure, DdcError::NullMessage) {
+                null_attempts += 1;
+                if null_attempts <= NULL_RETRIES {
+                    std::thread::sleep(self.config.scale(NULL_RETRY_DELAY));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                transport_attempts += 1;
+                if transport_attempts <= self.config.retries {
+                    std::thread::sleep(
+                        self.config.scale(self.config.min_command_interval)
+                            * transport_attempts,
+                    );
+                    true
+                } else {
+                    false
+                }
+            };
+
             // Keep the most informative failure rather than the most recent one, so a
             // display that answers with a null message once and then goes quiet is still
             // reported as present-but-refusing.
             if last.as_ref().is_none_or(|prev| failure.evidence() > prev.evidence()) {
                 last = Some(failure);
+            }
+            if !retry {
+                break;
             }
         }
 
@@ -223,6 +261,16 @@ impl I2cDdc {
         Ok(())
     }
 
+    /// Write once using a manufacturer-specific source byte, without read-back.
+    ///
+    /// LG input switching uses source 0x50 in the frame while retaining slave 0x37.
+    /// Other operations on this channel continue to use the standard source byte.
+    pub fn set_vcp_with_source(&mut self, code: u8, value: u16, source: u8) -> Result<()> {
+        self.write_frame(&protocol::set_vcp_request_with_source(code, value, source))?;
+        std::thread::sleep(self.config.scale(self.config.post_set_delay));
+        Ok(())
+    }
+
     /// Read the display's capabilities string.
     ///
     /// The string arrives in fragments; this walks the offsets until the display returns
@@ -236,11 +284,28 @@ impl I2cDdc {
         // real display while still bounding a misbehaving one.
         const MAX_FRAGMENTS: usize = 256;
 
+        // Extra rounds per fragment, on top of the retries inside exchange(). Observed
+        // MStar scalers corrupt roughly a third of capability fragments, which makes a
+        // whole multi-fragment read fail far too often on exchange()'s budget alone.
+        const FRAGMENT_ROUNDS: u32 = 3;
+
         for _ in 0..MAX_FRAGMENTS {
-            let payload = self.exchange(
-                &protocol::capabilities_request(offset),
-                MAX_PAYLOAD + 3,
-            )?;
+            let mut round = 0;
+            let payload = loop {
+                match self.exchange(
+                    &protocol::capabilities_request(offset),
+                    MAX_REPLY_PAYLOAD + 3,
+                ) {
+                    Ok(p) => break p,
+                    Err(Error::Ddc { source, .. })
+                        if source.is_retryable() && round < FRAGMENT_ROUNDS =>
+                    {
+                        round += 1;
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             let (reply_offset, fragment) = protocol::parse_capabilities_reply(&payload)
                 .map_err(|source| Error::Ddc { path: self.path.clone(), source })?;
 

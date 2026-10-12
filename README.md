@@ -50,6 +50,30 @@ wrong" and "go change one setting in the monitor's menu".
 
 ## Install
 
+### Build and releases
+
+Run `./scripts/build.sh` to build both binaries and create a `.tar.gz` archive plus
+a SHA-256 checksum in `dist/`. It includes the desktop entry, icon, udev rule and
+this README. Requirements: GNU/Linux, Rust installed through rustup, a C linker
+(for example `build-essential` on Ubuntu), Python 3, and standard GNU utilities.
+`rust-toolchain.toml` pins Rust 1.92.0; dependencies come from `Cargo.lock`.
+
+GitHub Actions runs workspace tests, doc tests, Clippy and documentation checks on
+pull requests and pushes to `main`. It also builds and checks a Linux x86-64 archive
+on Ubuntu 22.04 (glibc 2.35 or newer), available as a workflow artifact for 30 days.
+The GUI still needs the desktop's OpenGL and X11 or Wayland runtime libraries.
+
+To publish, update the workspace version and internal dependency versions in
+`Cargo.toml`, refresh `Cargo.lock`, commit, and push a matching tag such as `v0.1.0`.
+After tests and packaging succeed, CI publishes a GitHub Release with the archive,
+checksum and generated release notes. Tags must match the package version;
+versions containing `-`, such as `v0.2.0-rc.1`, produce prereleases.
+Manual workflow runs build artifacts without publishing a release.
+
+After downloading a release, run `sha256sum --check <archive>.tar.gz.sha256`,
+extract it, and install `monitorctl` and `monitorctl-gui` from the extracted folder
+using the destinations below. For a source checkout:
+
 ```sh
 cargo build --release
 install -Dm755 target/release/monitorctl ~/.local/bin/monitorctl
@@ -294,8 +318,9 @@ wants; [`monitor-control-gui`](crates/monitor-control-gui) is the real one.
   first route that answers instead of testing them all.
 - **Read the maximum from the display.** `VcpValue::maximum` is not always 100; use it for
   slider bounds rather than assuming a range.
-- **Build input menus from `parsed_capabilities`.** It reports the exact inputs a display
-  accepts, so the menu offers only values that will work.
+- **Build input menus from `available_inputs`.** It prefers the configured model profile over
+  the capabilities string, because some displays advertise input values their firmware
+  ignores (see *Monitor quirks* below).
 - **Switching input cuts the wire you sent the command over.** Moving a monitor to another
   machine's input takes the DDC/CI path with it, so the follow-up read fails. That is the
   command succeeding, not failing.
@@ -325,6 +350,85 @@ rotated display as upright.
 
 Matching a screen to a monitor survives the fact that DRM says `card1-HDMI-A-1` where a display
 server says `HDMI-1`, and that one monitor on two cables is two screens but one `Monitor`.
+
+## Monitor quirks
+
+Some displays deviate from MCCS in ways their own capabilities string does not admit. The
+library carries a quirk table (`monitor_control::quirks`) keyed by EDID identity. Entries
+distinguish hardware-tested behavior from mappings based on related displays.
+
+### LG 32GX870B-B
+
+Identified by EDID manufacturer `GSM` and product `0x7889`, with the EDID name
+`LG ULTRAGEAR+`. The capabilities string misleadingly names the model `WK95U`.
+
+- **Input writes use LG's private protocol:** VCP `0xF4`, source byte `0x50`,
+  retaining I2C slave address `0x37`. HDMI1 uses `0x90`, HDMI2 `0x91`, DP1 `0xD0`,
+  and USB-C `0xD1`.
+  Hardware testing switched from Linux on DisplayPort to a MacBook on HDMI2 and
+  returned to Linux. The library sends these commands once without read-back or
+  automatic replay on another path.
+- **Input read-back does not reflect the visible picture.** While the MacBook was
+  visible, reads over the inactive DP cable still returned DP1 (`0x60 = 0x0F`),
+  and private `0xF4` reads returned `0x06` on both inputs. `input_source()` reports
+  `InputReadbackUnavailable` for this model; raw `get_vcp()` remains available for
+  diagnostics. The CLI reports a switch as sent but unconfirmed. The GUI displays
+  the last requested input with `?`, explains it on hover, and does not save it as
+  the current input across restarts.
+- **All four physical inputs are selectable:** HDMI1, HDMI2, DP1, and USB-C.
+  DP1 and HDMI2 were verified with active video. HDMI1 and USB-C use mappings
+  reported for comparable LG displays (including the 45GX950A-B); these ports were
+  disconnected during local testing. The GUI uses this model profile rather than
+  the misleading capabilities list, which labels the second DP-family input DP2.
+  USB-C has no standard MCCS value and is only selectable by name on models with
+  an explicit mapping; `usbc`, `usb-c`, and `type-c` are accepted by the CLI.
+
+```sh
+monitorctl -m 'LG ULTRAGEAR+' input set hdmi2
+monitorctl -m 'LG ULTRAGEAR+' input set dp1
+monitorctl -m 'LG ULTRAGEAR+' input set hdmi1
+monitorctl -m 'LG ULTRAGEAR+' input set usb-c
+```
+
+The protocol is described in
+[ddcutil's LG input-switching investigation](https://github.com/rockowitz/ddcutil/wiki/Switching-input-source-on-LG-monitors).
+The quirk applies only to this EDID product, not every display named `LG ULTRAGEAR+`.
+
+### INNOCN 27M2V (MStar scaler)
+
+Everything below was established by live experiment against the hardware:
+
+- **Input switching uses a private encoding.** The capabilities string advertises the
+  standard MCCS values `60(11 12 0F 10)`, but writes of those values are silently ignored
+  (read-back confirms no change). The firmware reads and writes its own codes instead:
+  DisplayPort is `0x08` (verified switch and restore). `0x05`, `0x06`, `0x07`, and `0x09`
+  each select *some* other input, but their exact mapping could not be safely established
+  because of the next item. `monitorctl input set dp1` works; other names are refused with
+  an explanation rather than sent as values known to be ignored. Raw values
+  (`monitorctl input set 0x06`) remain available for deliberate experiments.
+- **Rapid DDC/CI input switching wedges the scaler.** After a few switches in quick
+  succession the OSD claims one input while the video pipeline stays on another — the
+  screen stays blank until a person cycles the input from the OSD. The tool therefore
+  writes an input switch exactly once, with no retry loop.
+- **Brightness writes are inert in HDR mode.** With the output in BT.2100 (`bt2100` in
+  GNOME's `monitors.xml`), VCP `0x10` writes are accepted and read back changed, but the
+  panel's luminance does not move. This is firmware behaviour, not a transport failure;
+  the write verifiably lands. Adjust brightness through the OSD or the compositor's
+  HDR-aware brightness control instead while HDR is on. (In SDR mode DDC brightness works
+  normally.)
+- **Replies exceed the spec's frame size.** Capabilities fragments arrive with 35-byte
+  payloads (the specification caps payloads at 32). The parser accepts reply payloads up
+  to the 127 bytes the wire format can express.
+- **Null messages arrive in clusters.** The scaler intermittently answers `GetVCP` with
+  DDC/CI null messages for over a second at a stretch (and ~30% of capabilities fragments
+  arrive corrupted, always with the same stale `0xDA` checksum byte). Retry schedules are
+  sized to outlast the measured clusters, and a null on one feature is treated as that
+  feature declining — not as the whole path being dead, since other features keep working
+  through it.
+- **DDC/CI only answers on the active input's DisplayPort AUX channel.** The HDMI
+  connector never responds at the DDC/CI address, and the DP AUX path drops within a
+  second of the panel switching away. A monitor that has just been switched to another
+  input is expected to be unreachable.
 
 ## Testing
 

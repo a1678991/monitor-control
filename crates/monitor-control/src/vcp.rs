@@ -40,11 +40,11 @@ pub fn code_name(code: u8) -> Option<&'static str> {
     })
 }
 
-/// A value of VCP feature `0x60`, Input Source.
+/// A named monitor input or a raw VCP input value.
 ///
 /// The standard MCCS values are named; anything else is preserved in
-/// [`InputSource::Other`], because vendors routinely define their own — USB-C inputs in
-/// particular are unstandardised and differ between manufacturers.
+/// [`InputSource::Other`]. USB-C is named separately, but has no standard MCCS value;
+/// its wire value must be supplied by the monitor's model profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(into = "String"))]
@@ -85,6 +85,8 @@ pub enum InputSource {
     Hdmi1,
     /// HDMI 2, MCCS `0x12`.
     Hdmi2,
+    /// USB-C video; its wire value is model-specific, not defined by MCCS.
+    UsbC,
     /// A value outside the MCCS table, kept verbatim.
     Other(u8),
 }
@@ -114,15 +116,17 @@ const INPUT_TABLE: &[(InputSource, u8, &[&str])] = &[
 ];
 
 impl InputSource {
-    /// The MCCS value for this input.
-    pub fn value(self) -> u8 {
+    /// The standard MCCS value, or the explicitly supplied raw value.
+    /// USB-C returns `None` because it requires a model-specific mapping.
+    pub fn value(self) -> Option<u8> {
         match self {
-            Self::Other(v) => v,
-            other => INPUT_TABLE
+            Self::UsbC => None,
+            Self::Other(v) => Some(v),
+            other => Some(INPUT_TABLE
                 .iter()
                 .find(|(src, _, _)| *src == other)
                 .map(|(_, v, _)| *v)
-                .expect("every non-Other variant appears in INPUT_TABLE"),
+                .expect("every standard variant appears in INPUT_TABLE")),
         }
     }
 
@@ -141,6 +145,7 @@ impl InputSource {
     /// The canonical name for this input.
     pub fn name(self) -> String {
         match self {
+            Self::UsbC => "usbc".into(),
             Self::Other(v) => format!("{v:#04x}"),
             other => INPUT_TABLE
                 .iter()
@@ -150,7 +155,8 @@ impl InputSource {
         }
     }
 
-    /// Every canonical input name, for help text and GUI pickers.
+    /// Every standard canonical input name and value. Model-specific inputs such as
+    /// USB-C are excluded; use a monitor's input list to discover those.
     pub fn all_names() -> impl Iterator<Item = (&'static str, u8)> {
         INPUT_TABLE.iter().map(|(_, v, names)| (names[0], *v))
     }
@@ -170,6 +176,10 @@ impl std::str::FromStr for InputSource {
             .chars()
             .filter(|c| !matches!(c, '-' | '_' | ' '))
             .collect();
+
+        if matches!(norm.as_str(), "usbc" | "typec") {
+            return Ok(Self::UsbC);
+        }
 
         if let Some((src, _, _)) = INPUT_TABLE
             .iter()
@@ -274,9 +284,9 @@ mod tests {
     #[test]
     fn input_names_match_the_shell_scripts_they_replace() {
         // The scripts being replaced used 0x0f, 0x11, and 0x12 directly.
-        assert_eq!("dp1".parse::<InputSource>().unwrap().value(), 0x0F);
-        assert_eq!("hdmi1".parse::<InputSource>().unwrap().value(), 0x11);
-        assert_eq!("hdmi2".parse::<InputSource>().unwrap().value(), 0x12);
+        assert_eq!("dp1".parse::<InputSource>().unwrap().value(), Some(0x0F));
+        assert_eq!("hdmi1".parse::<InputSource>().unwrap().value(), Some(0x11));
+        assert_eq!("hdmi2".parse::<InputSource>().unwrap().value(), Some(0x12));
     }
 
     #[test]
@@ -295,6 +305,17 @@ mod tests {
     }
 
     #[test]
+    fn usb_c_is_named_without_inventing_a_standard_wire_value() {
+        for name in ["usbc", "USB-C", "usb_c", "Type C"] {
+            assert_eq!(name.parse::<InputSource>().unwrap(), InputSource::UsbC);
+        }
+        assert_eq!(InputSource::UsbC.name(), "usbc");
+        assert_eq!(InputSource::UsbC.value(), None);
+        assert_eq!(InputSource::from_value(0xd1), InputSource::Other(0xd1));
+        assert!(!InputSource::all_names().any(|(name, _)| name == "usbc"));
+    }
+
+    #[test]
     fn unknown_input_names_are_rejected() {
         assert!("thunderbolt".parse::<InputSource>().is_err());
         assert!("999".parse::<InputSource>().is_err());
@@ -304,7 +325,7 @@ mod tests {
     fn every_named_input_round_trips() {
         for (name, value) in InputSource::all_names() {
             let parsed = name.parse::<InputSource>().expect("name parses");
-            assert_eq!(parsed.value(), value);
+            assert_eq!(parsed.value(), Some(value));
             assert_eq!(parsed.name(), name);
             assert_eq!(InputSource::from_value(value), parsed);
         }

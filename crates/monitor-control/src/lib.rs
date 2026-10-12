@@ -48,6 +48,7 @@ pub mod discovery;
 pub mod edid;
 pub mod error;
 pub mod monitor;
+pub mod quirks;
 pub mod vcp;
 
 pub use capabilities::Capabilities;
@@ -56,4 +57,5 @@ pub use discovery::{ConnectorKind, PathSource};
 pub use edid::{Edid, EdidId};
 pub use error::{DdcError, Error, Result};
 pub use monitor::{Monitor, MonitorManager, MonitorPath, PathStatus, Selector};
+pub use quirks::MonitorQuirks;
 pub use vcp::{InputSource, ValueChange, code};

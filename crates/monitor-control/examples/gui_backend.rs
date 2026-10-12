@@ -7,7 +7,7 @@
 //! generates no I2C traffic, so it is safe on the UI thread; probing and every get/set
 //! blocks for tens of milliseconds per exchange and belongs on a worker.
 
-use monitor_control::{Capabilities, DdcConfig, MonitorManager, ValueChange};
+use monitor_control::{DdcConfig, MonitorManager, ValueChange};
 
 fn main() -> monitor_control::Result<()> {
     // Startup: enumerate without touching any bus, so a window can be drawn immediately.
@@ -42,10 +42,18 @@ fn main() -> monitor_control::Result<()> {
             Err(e) => println!("  brightness unavailable: {e}"),
         }
 
-        // Ask the display which inputs it has, so a dropdown lists only real options.
-        match monitor.parsed_capabilities() {
-            Ok(caps) => print_input_choices(&caps),
-            Err(e) => println!("  capabilities unavailable: {e}"),
+        // Ask which inputs are switchable by name, so a dropdown lists only real
+        // options. This prefers the verified quirk table over the capabilities string,
+        // because some displays advertise input values their firmware ignores.
+        match monitor.available_inputs() {
+            Ok(inputs) if inputs.is_empty() => {
+                println!("  inputs: none verified; raw values may still work")
+            }
+            Ok(inputs) => {
+                let names: Vec<String> = inputs.iter().map(|i| i.to_string()).collect();
+                println!("  inputs: {}", names.join(", "));
+            }
+            Err(e) => println!("  inputs unavailable: {e}"),
         }
         println!();
     }
@@ -63,14 +71,4 @@ fn main() -> monitor_control::Result<()> {
     }
 
     Ok(())
-}
-
-fn print_input_choices(caps: &Capabilities) {
-    let inputs = caps.input_sources();
-    if inputs.is_empty() {
-        println!("  inputs: not enumerated by this display");
-        return;
-    }
-    let rendered: Vec<String> = inputs.iter().map(|i| i.to_string()).collect();
-    println!("  inputs: {}", rendered.join(", "));
 }

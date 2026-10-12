@@ -103,15 +103,17 @@ fn run(cli: Cli) -> monitor_control::Result<ExitCode> {
         Command::Input { action } => match action {
             Some(InputAction::List) => {
                 if g.json {
-                    let names: Vec<_> = InputSource::all_names()
+                    let mut names: Vec<_> = InputSource::all_names()
                         .map(|(n, v)| serde_json::json!({ "name": n, "value": v }))
                         .collect();
+                    names.push(serde_json::json!({ "name": "usbc", "value": null }));
                     print_json(&names)?;
                 } else {
                     println!("{:<16} VALUE", "NAME");
                     for (name, value) in InputSource::all_names() {
                         println!("{name:<16} {value:#04x}");
                     }
+                    println!("{:<16} model-specific", "usbc");
                     println!(
                         "\nVendor-specific inputs can be given as a raw value, e.g. `0x1b`."
                     );
@@ -122,19 +124,25 @@ fn run(cli: Cli) -> monitor_control::Result<ExitCode> {
                 let results = for_each(&mut manager, &selector, |m| {
                     if g.dry_run {
                         return Ok(Outcome::text(format!(
-                            "would set input to {input} ({:#04x})",
-                            input.value()
+                            "would set input to {input} ({})",
+                            describe_input_value(m, input)
                         )));
                     }
                     m.set_input_source(input)?;
-                    Ok(Outcome::text(format!("{input} ({:#04x})", input.value())))
+                    if m.quirks().is_some_and(|q| !q.input_readback_reliable) {
+                        return Ok(Outcome::text(format!(
+                            "sent {input} ({}); current input cannot be confirmed by this display",
+                            describe_input_value(m, input)
+                        )));
+                    }
+                    Ok(Outcome::text(format!("{input} ({})", describe_input_value(m, input))))
                 })?;
                 report(&results, "input", &g)
             }
             _ => {
                 let results = for_each(&mut manager, &selector, |m| {
                     let input = m.input_source()?;
-                    Ok(Outcome::text(format!("{input} ({:#04x})", input.value())))
+                    Ok(Outcome::text(format!("{input} ({})", describe_input_value(m, input))))
                 })?;
                 report(&results, "input", &g)
             }
@@ -172,7 +180,7 @@ fn run(cli: Cli) -> monitor_control::Result<ExitCode> {
                 if raw {
                     return Ok(Outcome::text(text));
                 }
-                Ok(Outcome::capabilities(&Capabilities::parse(&text)))
+                Ok(Outcome::capabilities(&Capabilities::parse(&text), m.quirks()))
             })?;
             if g.json {
                 print_json(&results)?;
@@ -181,9 +189,9 @@ fn run(cli: Cli) -> monitor_control::Result<ExitCode> {
             for r in &results {
                 match &r.outcome {
                     Outcome::Ok { text: Some(t), .. } => println!("{}:\n{t}\n", r.monitor),
-                    Outcome::Capabilities { capabilities } => {
+                    Outcome::Capabilities { capabilities, quirks } => {
                         println!("{}:", r.monitor);
-                        output::print_capabilities(capabilities);
+                        output::print_capabilities(capabilities, quirks.as_ref());
                         println!();
                     }
                     Outcome::Error { message } => eprintln!("{}: {message}", r.monitor),
@@ -261,6 +269,29 @@ fn report(results: &[OpResult], label: &str, g: &GlobalOpts) -> monitor_control:
 
 /// Whether an operation succeeded. Only the error variant counts as failure, so adding a
 /// new success-carrying variant cannot silently turn a working command into exit code 1.
+/// Render the wire value for an input on this particular monitor.
+///
+/// A display with a quirk entry uses its own encoding, and showing the MCCS value there
+/// would mislead anyone scripting raw values.
+fn describe_input_value(m: &Monitor, input: InputSource) -> String {
+    if let Some(q) = m.quirks()
+        && (q.input_vcp != code::INPUT_SOURCE || q.input_source_address != 0x51)
+        && let Some(wire) = q.encode_input(input)
+    {
+        return format!(
+            "VCP {:#04x}, source {:#04x}, value {wire:#04x}",
+            q.input_vcp, q.input_source_address
+        );
+    }
+    match m.quirks().and_then(|q| q.encode_input(input)) {
+        Some(wire) if Some(wire) != input.value() => format!("raw {wire:#04x}"),
+        _ => match input.value() {
+            Some(value) => format!("{value:#04x}"),
+            None => "requires a model-specific mapping".into(),
+        },
+    }
+}
+
 fn is_ok(r: &OpResult) -> bool {
     !matches!(r.outcome, Outcome::Error { .. })
 }

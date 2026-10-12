@@ -64,6 +64,9 @@ pub struct InputState {
     /// that fails would otherwise leave the window claiming an input the display never
     /// moved to.
     pub requested: Option<InputSource>,
+    /// Last command sent when the display cannot reliably report its visible input.
+    /// This is not a confirmed current input and is not persisted across app restarts.
+    pub last_sent: Option<InputSource>,
     /// Sequence number of the most recent switch the worker has finished with.
     pub applied_seq: u64,
     /// Why the last attempt to read or set the input failed, if it did.
@@ -212,19 +215,24 @@ impl MonitorState {
 
     /// The inputs to offer in a picker.
     ///
-    /// A display that answers the capabilities request names the inputs it really has, which
-    /// is the whole point of asking. One that refuses — and some do, while switching inputs
-    /// perfectly well — leaves nothing to filter by, so the full standard table is offered
-    /// rather than pretending the feature is missing.
+    /// Model quirks take precedence over capabilities, which can advertise inputs the
+    /// firmware ignores. Without either source, offer the standard input table.
     ///
     /// The input currently selected is always included, even when the display never listed
     /// it: monitors do report values they did not advertise, and dropping the current value
     /// from its own picker would be worse than showing a number nobody recognises.
     pub fn input_choices(&self) -> Vec<InputSource> {
-        let mut choices: Vec<InputSource> = match &self.caps {
-            Some(caps) if !caps.input_sources().is_empty() => caps.input_sources(),
-            _ => InputSource::all_names().map(|(_, value)| InputSource::from_value(value)).collect(),
-        };
+        let mut choices: Vec<InputSource> =
+            if let Some(q) = monitor_control::quirks::for_display(&self.edid) {
+                q.known_inputs().collect()
+            } else {
+                match &self.caps {
+                    Some(caps) if !caps.input_sources().is_empty() => caps.input_sources(),
+                    _ => InputSource::all_names()
+                        .map(|(_, value)| InputSource::from_value(value))
+                        .collect(),
+                }
+            };
         if let Some(current) = self.input.current
             && !choices.contains(&current)
         {
@@ -233,9 +241,10 @@ impl MonitorState {
         choices
     }
 
-    /// Whether the display listed its own inputs, rather than being offered the full table.
+    /// Whether a quirk or capabilities list is available instead of the full table.
     pub fn enumerated_inputs(&self) -> bool {
-        self.caps.as_ref().is_some_and(|c| !c.input_sources().is_empty())
+        monitor_control::quirks::for_display(&self.edid).is_some()
+            || self.caps.as_ref().is_some_and(|c| !c.input_sources().is_empty())
     }
 
     /// Whether the display implements input switching, as far as anything can tell.
@@ -243,9 +252,41 @@ impl MonitorState {
     /// A refused capabilities string is not evidence either way, so the answer then rests on
     /// whether the input could be read at all.
     pub fn supports_input(&self) -> bool {
+        if let Some(q) = monitor_control::quirks::for_display(&self.edid) {
+            return !q.input_codes.is_empty();
+        }
         match &self.caps {
             Some(caps) => caps.supports(code::INPUT_SOURCE),
             None => self.input.current.is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lg_picker_offers_all_four_ports_even_without_a_current_input() {
+        let edid = EdidId {
+            manufacturer: "GSM".into(), product_code: 0x7889,
+            serial: 1, serial_string: None, model: Some("LG ULTRAGEAR+".into()),
+            year: 2026, week: 1,
+        };
+        let mut state = MonitorState::new(
+            MonitorId { key: edid.key(), connector: "card1-DP-1".into() },
+            edid, None, false, vec![],
+        );
+        // The LG advertises a misleading list. Neither it nor a missing capabilities
+        // reply should hide the configured selector or replace USB-C with DP2.
+        for caps in [None, Some(Capabilities::parse("(vcp(60(11 12 0F 10)))"))] {
+            state.caps = caps;
+            assert!(state.supports_input());
+            assert!(state.enumerated_inputs());
+            assert_eq!(state.input_choices(), vec![
+                InputSource::Hdmi1, InputSource::Hdmi2, InputSource::DisplayPort1, InputSource::UsbC,
+            ]);
+            assert_eq!(state.input.current, None);
         }
     }
 }

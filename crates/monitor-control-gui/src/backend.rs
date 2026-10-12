@@ -396,6 +396,10 @@ fn refresh(monitor: &mut Monitor, state: &mut MonitorState, publish: &impl Fn(&M
     }
 
     match monitor.input_source() {
+        Err(Error::InputReadbackUnavailable { .. }) => {
+            state.input.current = None;
+            state.input.error = None;
+        }
         Ok(input) => {
             state.input.current = Some(input);
             state.input.requested = None;
@@ -473,6 +477,13 @@ fn set_input(monitor: &mut Monitor, state: &mut MonitorState, input: InputSource
             state.input.switched_away = false;
             state.last_error = None;
 
+            if monitor.quirks().is_some_and(|q| !q.input_readback_reliable) {
+                state.input.current = None;
+                state.input.requested = None;
+                state.input.last_sent = Some(input);
+                return;
+            }
+
             // Waiting is cheap here: this thread has nothing else to do, and every other
             // monitor has a thread of its own.
             thread::sleep(INPUT_SETTLE);
@@ -480,6 +491,11 @@ fn set_input(monitor: &mut Monitor, state: &mut MonitorState, input: InputSource
                 Ok(actual) => {
                     state.input.current = Some(actual);
                     state.input.requested = None;
+                    if actual != input {
+                        state.input.error = Some(format!(
+                            "Requested {input}, but the display still reports {actual}"
+                        ));
+                    }
                 }
                 // Losing the connection is what switching a monitor to another machine's
                 // input does. Reporting it as a failure would be exactly backwards — but so

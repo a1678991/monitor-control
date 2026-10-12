@@ -43,17 +43,32 @@ pub mod op {
     pub const CAPS_REPLY: u8 = 0xE3;
 }
 
-/// Longest payload a DDC/CI frame can carry, from the 5-bit length field.
+/// Longest payload this crate puts in a request frame, per the DDC/CI specification.
 pub const MAX_PAYLOAD: usize = 32;
+
+/// Longest payload a reply can declare: the length field is 7 bits.
+///
+/// The specification says 32 here too, but real displays exceed it — an INNOCN 27M2V
+/// (MStar scaler) answers capabilities requests with 35-byte payloads. Rejecting those
+/// frames would make capabilities unreadable on such displays, so replies are accepted up
+/// to what the wire format can express.
+pub const MAX_REPLY_PAYLOAD: usize = 127;
 
 /// Total bytes in a reply to Get VCP Feature: address, length, 8 payload bytes, checksum.
 pub const GET_VCP_REPLY_LEN: usize = 11;
 
 /// Build a complete request frame, including the trailing checksum.
 pub fn encode_request(payload: &[u8]) -> Vec<u8> {
+    encode_request_with_source(payload, HOST_ADDR)
+}
+
+/// Build a request with a manufacturer-specific source byte and matching checksum.
+///
+/// This changes the source byte inside the frame, not the I2C slave address (0x37).
+pub fn encode_request_with_source(payload: &[u8], source: u8) -> Vec<u8> {
     debug_assert!(payload.len() <= MAX_PAYLOAD, "payload exceeds DDC/CI frame limit");
     let mut frame = Vec::with_capacity(payload.len() + 3);
-    frame.push(HOST_ADDR);
+    frame.push(source);
     frame.push(0x80 | payload.len() as u8);
     frame.extend_from_slice(payload);
     let checksum = frame.iter().fold(DISPLAY_WRITE_ADDR, |acc, b| acc ^ b);
@@ -100,11 +115,6 @@ pub fn decode_reply(buf: &[u8], strict_checksum: bool) -> Result<Reply, DdcError
     }
 
     let len = usize::from(buf[1] & 0x7F);
-    if len > MAX_PAYLOAD {
-        return Err(DdcError::Malformed(format!(
-            "declared payload length {len} exceeds the {MAX_PAYLOAD}-byte maximum"
-        )));
-    }
     let total = len + 3;
     if buf.len() < total {
         return Err(DdcError::Malformed(format!(
@@ -173,8 +183,13 @@ pub fn get_vcp_request(code: u8) -> Vec<u8> {
 
 /// Build a Set VCP Feature request writing `value` to `code`.
 pub fn set_vcp_request(code: u8, value: u16) -> Vec<u8> {
+    set_vcp_request_with_source(code, value, HOST_ADDR)
+}
+
+/// Build a Set VCP request using a manufacturer-specific source byte.
+pub fn set_vcp_request_with_source(code: u8, value: u16, source: u8) -> Vec<u8> {
     let [hi, lo] = value.to_be_bytes();
-    encode_request(&[op::SET_VCP, code, hi, lo])
+    encode_request_with_source(&[op::SET_VCP, code, hi, lo], source)
 }
 
 /// Build a Capabilities Request for the fragment starting at `offset`.
@@ -240,6 +255,20 @@ pub fn parse_capabilities_reply(payload: &[u8]) -> Result<(u16, &[u8]), DdcError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lg_input_frames_use_private_source_and_matching_checksum() {
+        assert_eq!(
+            set_vcp_request_with_source(0xf4, 0x0091, 0x50),
+            vec![0x50, 0x84, 0x03, 0xf4, 0x00, 0x91, 0xdc],
+        );
+        assert_eq!(
+            set_vcp_request_with_source(0xf4, 0x00d0, 0x50),
+            vec![0x50, 0x84, 0x03, 0xf4, 0x00, 0xd0, 0x9d],
+        );
+        // A private command must not change the source used by later ordinary writes.
+        assert_eq!(set_vcp_request(0x60, 0x12), vec![0x51, 0x84, 0x03, 0x60, 0x00, 0x12, 0xca]);
+    }
 
     /// Frames captured from a DELL G3223Q and cross-checked against `ddcutil`.
     const REAL_BRIGHTNESS_REQUEST: [u8; 5] = [0x51, 0x82, 0x01, 0x10, 0xAC];
@@ -346,6 +375,21 @@ mod tests {
         assert_eq!(frame[..6], [0x51, 0x84, 0x03, 0x60, 0x00, 0x11]);
         let checksum = frame[..6].iter().fold(0x6Eu8, |a, b| a ^ b);
         assert_eq!(*frame.last().unwrap(), checksum);
+    }
+
+    #[test]
+    fn oversized_reply_payloads_are_accepted() {
+        // An INNOCN 27M2V answers capabilities requests with 35-byte payloads, above the
+        // spec's 32-byte cap. The frame is otherwise conforming and must decode.
+        let mut frame = vec![0x6E, 0x80 | 35, 0xE3, 0x00, 0x00];
+        frame.extend(std::iter::repeat_n(b'x', 32));
+        let checksum = frame.iter().fold(0x50u8, |a, b| a ^ b);
+        frame.push(checksum);
+        let reply = decode_reply(&frame, true).expect("oversized payload decodes");
+        assert_eq!(reply.payload.len(), 35);
+        let (offset, fragment) = parse_capabilities_reply(&reply.payload).expect("caps");
+        assert_eq!(offset, 0);
+        assert_eq!(fragment.len(), 32);
     }
 
     #[test]

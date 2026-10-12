@@ -626,8 +626,13 @@ fn input_chip(
     let label = match (pending, current) {
         (Some(input), _) => format!("» {}", names::input_chip(input)),
         (None, Some(input)) => names::input_chip(input),
-        (None, None) => "input".to_string(),
+        (None, None) => match state.input.last_sent {
+            Some(input) => format!("{}?", names::input_chip(input)),
+            None => "input".to_string(),
+        },
     };
+
+    let label = if state.input.error.is_some() { format!("{label} !") } else { label };
 
     // Keyed by identity: an open list must stay on the monitor it was opened for, even if a
     // hotplug renumbers the rows underneath it.
@@ -638,10 +643,7 @@ fn input_chip(
             for choice in &choices {
                 let selected = current == Some(*choice);
                 if ui
-                    .selectable_label(
-                        selected,
-                        format!("{}   {:#04x}", names::input_name(*choice), choice.value()),
-                    )
+                    .selectable_label(selected, names::input_name(*choice))
                     .clicked()
                 {
                     chosen = Some(*choice);
@@ -659,11 +661,18 @@ fn input_chip(
                 );
             }
         });
-    combo.response.on_hover_text(match (pending, current) {
+    let input_hint = match (pending, current) {
         (Some(input), _) => format!("Switching to {}…", names::input_name(input)),
         (None, Some(input)) => format!("Showing {} — click to switch", names::input_name(input)),
-        (None, None) => "Switch this display's input".to_string(),
-    });
+        (None, None) => match state.input.last_sent {
+            Some(input) => format!(
+                "Sent a switch to {}. This display cannot confirm its current input.",
+                names::input_name(input)
+            ),
+            None => "Switch this display's input".to_string(),
+        },
+    };
+    combo.response.on_hover_text(state.input.error.as_deref().unwrap_or(&input_hint));
 
     if let Some(input) = chosen {
         app.set_input(index, input);

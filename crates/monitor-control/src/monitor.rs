@@ -8,6 +8,7 @@ use crate::ddc::{DdcConfig, I2cDdc, VcpValue};
 use crate::discovery::{self, ConnectorKind, PathSource};
 use crate::edid::{Edid, EdidId};
 use crate::error::{DdcError, Error, Result};
+use crate::quirks::{self, MonitorQuirks};
 use crate::vcp::{self, InputSource, ValueChange, code};
 
 /// What a probe learned about one path.
@@ -256,10 +257,16 @@ impl Monitor {
                 Err(e @ Error::Ddc { source: DdcError::UnsupportedFeature { .. }, .. }) => {
                     return Err(e);
                 }
+                // A persistent null message on one feature means the display declined
+                // that request — displays that answer brightness but null on input
+                // source exist (INNOCN 27M2V). The path still works; failing it over
+                // would take down features that were fine a moment ago.
+                Err(e @ Error::Ddc { source: DdcError::NullMessage, .. }) => {
+                    return Err(e);
+                }
                 Err(e) => {
                     self.channel = None;
                     self.paths[index].status = match &e {
-                        Error::Ddc { source: DdcError::NullMessage, .. } => PathStatus::DdcDisabled,
                         Error::Ddc { .. } => PathStatus::Unresponsive,
                         other => PathStatus::Unavailable { reason: other.to_string() },
                     };
@@ -275,14 +282,87 @@ impl Monitor {
         unreachable!("the loop returns on both rounds")
     }
 
+    /// Send a state-changing command once. A failed transfer must not be replayed on
+    /// another path: the display may already have switched away during the transfer.
+    fn with_channel_once<T>(
+        &mut self,
+        op: impl FnOnce(&mut I2cDdc) -> Result<T>,
+    ) -> Result<T> {
+        let index = self.ensure_path()?;
+        if self.channel.as_ref().map(|c| c.path() != self.paths[index].device) != Some(false) {
+            self.channel = Some(I2cDdc::open_path(
+                self.paths[index].device.clone(),
+                self.config.clone(),
+            )?);
+        }
+        let result = op(self.channel.as_mut().expect("channel opened above"));
+        if result.is_err() {
+            self.channel = None;
+            self.preferred = None;
+            self.paths[index].status = PathStatus::Unprobed;
+        }
+        result
+    }
+
     /// Read a VCP feature.
     pub fn get_vcp(&mut self, code: u8) -> Result<VcpValue> {
         self.with_channel(|c| c.get_vcp(code))
     }
 
-    /// Write a VCP feature.
+    /// Write a VCP feature, verifying it landed when the display allows.
+    ///
+    /// Single writes get silently dropped on flaky scalers (measured at roughly 1 in 12
+    /// on an MStar-based display), so the write is read back and retried a bounded number
+    /// of times. Two cases intentionally skip verification:
+    ///
+    /// - Input source (`0x60` or a model's private selector): switching input usually
+    ///   takes this path down with it, and at least one scaler wedges — OSD saying one
+    ///   input, screen showing another — when switches arrive in quick succession.
+    ///   Input is written exactly once.
+    /// - Displays that cannot report the feature back (null message or unsupported): the
+    ///   write is sent and trusted.
     pub fn set_vcp(&mut self, code: u8, value: u16) -> Result<()> {
-        self.with_channel(move |c| c.set_vcp(code, value))
+        if code == code::INPUT_SOURCE || self.quirks().is_some_and(|q| q.input_vcp == code) {
+            return self.with_channel_once(move |c| c.set_vcp(code, value));
+        }
+
+        // One initial write plus two verified retries puts the odds of all three
+        // dropping (at the observed ~8% drop rate) below one in a thousand.
+        const WRITE_ATTEMPTS: u32 = 3;
+
+        let mut last_seen = None;
+        for _ in 0..WRITE_ATTEMPTS {
+            self.with_channel(move |c| c.set_vcp(code, value))?;
+            match self.get_vcp(code) {
+                Ok(read_back) if read_back.current == value => return Ok(()),
+                Ok(read_back) => last_seen = Some(read_back.current),
+                // The display cannot report this feature back; trust the write.
+                Err(Error::Ddc {
+                    source: DdcError::UnsupportedFeature { .. } | DdcError::NullMessage,
+                    ..
+                }) => return Ok(()),
+                // The path died mid-verify; with_channel already recorded that, and the
+                // next attempt's set will fail over or surface the error.
+                Err(_) => last_seen = None,
+            }
+        }
+
+        match last_seen {
+            // The display consistently reports a different value: it accepted the frame
+            // and refused the change, the way a monitor in HDR mode pins brightness or a
+            // scaler ignores values outside its real range. Retrying cannot help, and
+            // pretending success would hide exactly the failure the caller asked about.
+            Some(actual) => Err(Error::Ddc {
+                path: self
+                    .active_path()
+                    .map(|p| p.device.clone())
+                    .unwrap_or_default(),
+                source: DdcError::Malformed(format!(
+                    "display did not apply the write: {code:#04x} reads back {actual} after                      writing {value}"
+                )),
+            }),
+            None => self.with_channel(move |c| c.set_vcp(code, value)),
+        }
     }
 
     /// Apply a relative, absolute, or percentage change to a continuous feature.
@@ -323,12 +403,29 @@ impl Monitor {
         self.adjust_vcp(code::CONTRAST, change)
     }
 
+    /// Quirks recorded for this display model, if any.
+    pub fn quirks(&self) -> Option<&'static MonitorQuirks> {
+        quirks::for_display(&self.id)
+    }
+
     /// Read the currently selected input.
     ///
     /// Only the low byte of VCP `0x60` is meaningful; the high byte is vendor-specific.
+    /// Displays with a quirk entry report in their own encoding, which is translated
+    /// here; an unmapped value is returned raw rather than mislabelled.
+    /// A display known to return stale input reports yields
+    /// [`Error::InputReadbackUnavailable`]; raw [`Monitor::get_vcp`] remains available
+    /// for diagnostics.
     pub fn input_source(&mut self) -> Result<InputSource> {
+        if self.quirks().is_some_and(|q| !q.input_readback_reliable) {
+            return Err(Error::InputReadbackUnavailable { name: self.name() });
+        }
         let value = self.get_vcp(code::INPUT_SOURCE)?;
-        Ok(InputSource::from_value(value.low_byte()))
+        let low = value.low_byte();
+        Ok(match self.quirks() {
+            Some(q) => q.decode_input(low),
+            None => InputSource::from_value(low),
+        })
     }
 
     /// Switch the display to another input.
@@ -336,8 +433,36 @@ impl Monitor {
     /// Note that switching a monitor away from this machine's input usually takes the
     /// path this command travelled with it, so a follow-up read will fail. That is the
     /// command working, not failing.
+    ///
+    /// On displays with a quirk entry the named input is translated to the value the
+    /// firmware really uses. Asking for a name the table cannot translate is an error —
+    /// sending the standard value instead would be silently ignored at best, and on
+    /// fragile scalers an experimental wrong value can wedge the input selector. Raw
+    /// values (`InputSource::Other`) always pass through for people probing deliberately.
     pub fn set_input_source(&mut self, input: InputSource) -> Result<()> {
-        self.set_vcp(code::INPUT_SOURCE, u16::from(input.value()))
+        let value = match self.quirks() {
+            Some(q) => q.encode_input(input).ok_or_else(|| {
+                let known: Vec<String> =
+                    q.known_inputs().map(|i| i.to_string()).collect();
+                Error::Parse(format!(
+                    "`{}` cannot switch to `{input}` by name: this display uses non-standard \
+                     input codes and only [{}] are configured. Raw numeric values remain \
+                     available for deliberate experiments",
+                    self.name(),
+                    if known.is_empty() { "none".to_string() } else { known.join(", ") },
+                ))
+            })?,
+            None => input.value().ok_or_else(|| Error::Parse(format!(
+                "`{}` has no model-specific mapping for `{input}`",
+                self.name()
+            )))?,
+        };
+        if let Some(q) = self.quirks() {
+            return self.with_channel_once(|c| {
+                c.set_vcp_with_source(q.input_vcp, u16::from(value), q.input_source_address)
+            });
+        }
+        self.set_vcp(code::INPUT_SOURCE, u16::from(value))
     }
 
     /// Read the display's capabilities string.
@@ -347,11 +472,28 @@ impl Monitor {
 
     /// Read and parse the display's capabilities.
     ///
-    /// The parsed form tells a caller which features this particular display implements
-    /// and, for input switching, exactly which inputs it accepts — enough to build a menu
-    /// that offers only what will work.
+    /// The parsed form tells a caller which features this particular display implements.
+    /// For input switching prefer [`Monitor::available_inputs`]: a capabilities string
+    /// can advertise input values the firmware ignores, and that method knows when not
+    /// to trust it.
     pub fn parsed_capabilities(&mut self) -> Result<Capabilities> {
         Ok(Capabilities::parse(&self.capabilities()?))
+    }
+
+    /// The configured named inputs, preferring model profiles over capabilities.
+    ///
+    /// For displays with a quirk entry this is the model's configured list — the capabilities
+    /// string of such displays advertises standard values the firmware silently ignores,
+    /// which is precisely why the quirk exists. For everything else it is the list the
+    /// display advertises. An empty answer means the display gave no usable list, not
+    /// that switching is impossible; raw values may still work.
+    ///
+    /// This is the method a GUI input menu should be built from.
+    pub fn available_inputs(&mut self) -> Result<Vec<InputSource>> {
+        if let Some(q) = self.quirks() {
+            return Ok(q.known_inputs().collect());
+        }
+        Ok(self.parsed_capabilities()?.input_sources())
     }
 }
 
@@ -581,5 +723,33 @@ pub fn describe_vcp(code: u8) -> String {
     match vcp::code_name(code) {
         Some(name) => format!("{code:#04x} ({name})"),
         None => format!("{code:#04x}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lg_stale_input_is_never_reported_as_current() {
+        let mut monitor = Monitor {
+            id: EdidId {
+                manufacturer: "GSM".into(), product_code: 0x7889,
+                serial: 1, serial_string: None, model: Some("LG ULTRAGEAR+".into()),
+                year: 2026, week: 1,
+            },
+            paths: vec![], edid: vec![], ambiguous_grouping: false,
+            preferred: None, channel: None, config: DdcConfig::default(),
+        };
+        // No transport is even opened: a successful stale read must not escape.
+        assert!(matches!(monitor.input_source(), Err(Error::InputReadbackUnavailable { .. })));
+        assert_eq!(monitor.available_inputs().unwrap(), vec![
+            InputSource::Hdmi1, InputSource::Hdmi2, InputSource::DisplayPort1, InputSource::UsbC,
+        ]);
+        assert!(matches!(monitor.set_input_source(InputSource::DisplayPort2), Err(Error::Parse(_))));
+        // Ordinary monitors still attempt a real read instead of inheriting this quirk.
+        monitor.id.product_code = 0x7888;
+        assert!(matches!(monitor.set_input_source(InputSource::UsbC), Err(Error::Parse(_))));
+        assert!(matches!(monitor.input_source(), Err(Error::NoWorkingPath { .. })));
     }
 }

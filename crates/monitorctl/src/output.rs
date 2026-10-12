@@ -1,7 +1,8 @@
 //! Rendering results as text or JSON.
 
 use monitor_control::{
-    Capabilities, Monitor, MonitorPath, PathStatus, VcpValue, monitor::describe_vcp, vcp,
+    Capabilities, Monitor, MonitorPath, MonitorQuirks, PathStatus, VcpValue,
+    monitor::describe_vcp, vcp,
 };
 use serde::Serialize;
 
@@ -20,7 +21,41 @@ pub struct MonitorReport {
     pub ambiguous_grouping: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quirks: Option<QuirksReport>,
     pub paths: Vec<PathReport>,
+}
+
+/// Verified deviations from MCCS for this display model.
+#[derive(Serialize)]
+pub struct QuirksReport {
+    /// All inputs offered by the model profile, including mappings not tested locally.
+    pub configured_inputs: Vec<String>,
+    /// Inputs that switching by name is verified to work for, with their wire values.
+    pub verified_inputs: Vec<String>,
+    /// Rapid DDC/CI input switching can desynchronise this display's input selector
+    /// from its video pipeline; switch once and let it settle.
+    pub fragile_input_switching: bool,
+}
+
+impl QuirksReport {
+    fn new(q: &MonitorQuirks) -> Self {
+        Self {
+            configured_inputs: q.known_inputs()
+                .map(|i| match q.encode_input(i) {
+                    Some(wire) => format!("{i} (raw {wire:#04x})"),
+                    None => i.to_string(),
+                })
+                .collect(),
+            verified_inputs: q.verified_inputs.iter()
+                .map(|&i| match q.encode_input(i) {
+                    Some(wire) => format!("{i} (raw {wire:#04x})"),
+                    None => i.to_string(),
+                })
+                .collect(),
+            fragile_input_switching: q.fragile_input_switching,
+        }
+    }
 }
 
 /// One route to a monitor.
@@ -83,6 +118,7 @@ impl MonitorReport {
             controllable: m.is_controllable(),
             ambiguous_grouping: m.ambiguous_grouping,
             active_path: m.active_path().map(MonitorPath::describe),
+            quirks: m.quirks().map(QuirksReport::new),
             paths: m.paths.iter().map(PathReport::new).collect(),
         }
     }
@@ -115,6 +151,8 @@ pub enum Outcome {
     /// A parsed capabilities string.
     Capabilities {
         capabilities: Capabilities,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quirks: Option<QuirksReport>,
     },
     Error {
         message: String,
@@ -139,8 +177,11 @@ impl Outcome {
         Self::Ok { value: None, maximum: None, percent: None, text: Some(text.into()) }
     }
 
-    pub fn capabilities(caps: &Capabilities) -> Self {
-        Self::Capabilities { capabilities: caps.clone() }
+    pub fn capabilities(caps: &Capabilities, quirks: Option<&MonitorQuirks>) -> Self {
+        Self::Capabilities {
+            capabilities: caps.clone(),
+            quirks: quirks.map(QuirksReport::new),
+        }
     }
 }
 
@@ -191,6 +232,16 @@ pub fn print_detect(reports: &[MonitorReport], show_all_paths: bool) {
             }
         }
 
+        if let Some(q) = &r.quirks {
+            println!(
+                "  note:         non-standard input codes; switchable by name: {}",
+                if q.configured_inputs.is_empty() {
+                    "none configured".to_string()
+                } else {
+                    q.configured_inputs.join(", ")
+                }
+            );
+        }
         if r.ambiguous_grouping {
             println!(
                 "  note:         this display reports no serial number, so paths were \
@@ -254,9 +305,9 @@ pub fn print_results(results: &[OpResult], label: &str) {
                 };
                 println!("{}: {label} = {rendered}", r.monitor);
             }
-            Outcome::Capabilities { capabilities } => {
+            Outcome::Capabilities { capabilities, quirks } => {
                 println!("{}: {label}", r.monitor);
-                print_capabilities(capabilities);
+                print_capabilities(capabilities, quirks.as_ref());
             }
             Outcome::Error { message } => {
                 eprintln!("{}: {message}", r.monitor);
@@ -281,7 +332,7 @@ pub fn format_vcp(code: u8, v: &VcpValue) -> String {
 ///
 /// The feature list is grouped rather than dumped: what a caller almost always wants from
 /// this command is which inputs the display accepts, so that goes first and in full.
-pub fn print_capabilities(caps: &Capabilities) {
+pub fn print_capabilities(caps: &Capabilities, quirks: Option<&QuirksReport>) {
     if let Some(model) = &caps.model {
         println!("  model:        {model}");
     }
@@ -293,10 +344,24 @@ pub fn print_capabilities(caps: &Capabilities) {
     }
 
     let inputs = caps.input_sources();
-    if !inputs.is_empty() {
+    if let Some(q) = quirks {
+        // The advertised list is exactly what this display's firmware ignores; showing
+        // it as usable would send people back to the bug the quirk entry fixed.
+        let configured = if q.configured_inputs.is_empty() {
+            "none configured".to_string()
+        } else {
+            q.configured_inputs.join(", ")
+        };
+        println!(
+            "  inputs:       {configured} — model-specific mappings"
+        );
+    } else if !inputs.is_empty() {
         let rendered: Vec<String> = inputs
             .iter()
-            .map(|i| format!("{i} ({:#04x})", i.value()))
+            .map(|i| match i.value() {
+                Some(value) => format!("{i} ({value:#04x})"),
+                None => i.to_string(),
+            })
             .collect();
         println!("  inputs:       {}", rendered.join(", "));
     } else if caps.supports(vcp::code::INPUT_SOURCE) {

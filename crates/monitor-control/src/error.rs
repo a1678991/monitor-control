@@ -126,6 +126,13 @@ pub enum Error {
     #[error("no monitor matched selector `{0}`")]
     NoMatch(String),
 
+    /// Firmware returns a stale input value even after the visible input changes.
+    #[error("monitor `{name}` does not reliably report its current input; input switching is still available")]
+    InputReadbackUnavailable {
+        /// The monitor's display name.
+        name: String,
+    },
+
     /// The monitor was found but none of its connection paths can carry DDC/CI.
     #[error("monitor `{name}` has no working DDC/CI path ({detail})")]
     NoWorkingPath {
